@@ -14,6 +14,7 @@ Dever, J. A. (2018) [#vd2018]_ and Wolter, K.M. (2007) [#w2007]_ for more detail
 from __future__ import annotations
 
 import math
+
 from typing import Optional, Union
 
 import numpy as np
@@ -22,6 +23,7 @@ import pandas as pd
 from samplics.utils import checks, formats
 from samplics.utils import hadamard as hdd
 from samplics.utils.types import Array, Number, RepMethod
+from samplics.weighting.calibrated import CalibratedReplicates, calibrate_replicates
 
 
 class ReplicateWeight:
@@ -59,7 +61,7 @@ class ReplicateWeight:
             self.nb_reps = nb_reps
             self.rep_coefs = list((1 / nb_reps) * np.ones(nb_reps))
         elif self.method == RepMethod.brr:
-            self.nb_reps = 0
+            self.nb_reps = nb_reps
             self.fay_coef = fay_coef
 
         self.nb_psus = 0
@@ -106,13 +108,20 @@ class ReplicateWeight:
         stratum = formats.numpy_array(stratum)
         psu = formats.numpy_array(psu)
 
-        if stratum.size <= 1:
+        if stratum is None or stratum.size <= 1:
             self.degree_of_freedom = np.unique(psu).size - 1
-        elif psu.size > 1:
-            self.degree_of_freedom = np.unique(psu).size - np.unique(stratum).size
         else:
-            weight = formats.numpy_array(weight)
-            self.degree_of_freedom = weight.size
+            # Degrees of freedom count distinct (stratum, PSU) pairs minus the
+            # number of strata; PSU labels may repeat across strata and labels
+            # may be strings, so count pairs via a structured-array view.
+            pairs = np.rec.fromarrays(
+                [np.asarray(stratum), np.asarray(psu)], names="stratum, psu"
+            )
+            nb_psus = np.unique(pairs).size
+            nb_strata = np.unique(stratum).size
+            self.nb_psus = nb_psus
+            self.nb_strata = nb_strata
+            self.degree_of_freedom = nb_psus - nb_strata
 
     # Bootstrap methods
     @staticmethod
@@ -172,7 +181,10 @@ class ReplicateWeight:
             self.nb_psus = np.unique(psu).size
             self.nb_strata = self.nb_psus // 2 + self.nb_psus % 2
         else:
-            self.nb_psus = np.unique(np.array(list(zip(stratum, psu))), axis=0).shape[0]
+            pairs = np.rec.fromarrays(
+                [np.asarray(stratum), np.asarray(psu)], names="stratum, psu"
+            )
+            self.nb_psus = np.unique(pairs).size
             self.nb_strata = np.unique(stratum).size
             if 2 * self.nb_strata != self.nb_psus:
                 raise AssertionError("Number of psus must be twice the number of strata!")
@@ -180,13 +192,15 @@ class ReplicateWeight:
         if self.nb_reps < self.nb_strata:
             self.nb_reps = self.nb_strata
 
+        # The Hadamard construction needs a multiple of 4 not smaller than the
+        # requested number of replicates (rounding downward previously
+        # produced matrices smaller than nb_strata and raised IndexError).
         if self.nb_reps <= 28:
             if self.nb_reps % 4 != 0:
                 self.nb_reps = 4 * (self.nb_reps // 4 + 1)
         else:
-            nb_reps_log2 = int(math.log(self.nb_reps, 2))
-            if math.pow(2, nb_reps_log2) != self.nb_reps:
-                self.nb_reps = int(math.pow(2, nb_reps_log2))
+            nb_reps_log2 = int(math.ceil(math.log(self.nb_reps, 2)))
+            self.nb_reps = int(math.pow(2, nb_reps_log2))
 
     def _brr_replicates(self, psu: np.ndarray, stratum: Optional[np.ndarray]) -> np.ndarray:
         """Creates the brr replicate structure"""
@@ -259,32 +273,110 @@ class ReplicateWeight:
         rep_prefix: Optional[str] = None,
         psu_varname: str = "_psu",
         str_varname: str = "_stratum",
-    ) -> pd.DataFrame:
-        """Computes replicate sample weights.
+        *,
+        calibration: Optional[dict] = None,
+        conservative: bool = False,
+    ) -> Union[pd.DataFrame, CalibratedReplicates]:
+        """Computes replicate sample weights, optionally with bounded calibration.
+
+        When ``calibration`` is ``None`` the legacy dataframe of uncalibrated
+        replicate weights is returned. When a calibration mapping is provided,
+        the full sample is calibrated first and every replicate column is then
+        calibrated independently against its own base weights (including its
+        own structural zeros); a :class:`CalibratedReplicates` batch is
+        returned.
 
         Args:
-            samp_weight (Array): array of sample weights. To incorporate the weights adjustment
-                in the replicate weights, first replicate the design sample weights then apply
-                the adjustments to the replicates.
-            psu (Array):
+            samp_weight (Array): array of sample weights.
+            psu (Array): PSU labels.
             stratum (Array, optional): array of the strata. Defaults to None.
-            rep_coefs (Union[Array, Number], optional): coefficients associated to the replicates.
-                Defaults to False.
-            rep_prefix (str, optional): prefix to apply to the replicate weights names.
-                Defaults to None.
-            psu_varname (str, optional): name of the psu variable in the output dataframe.
-                Defaults to "_psu".
-            str_varname (str, optional): name of the stratum variable in the output dataframe.
-                Defaults to "_stratum".
+            rep_coefs (Union[Array, Number], optional): coefficients associated
+                to the replicates. Defaults to False.
+            rep_prefix (str, optional): prefix for the replicate column names.
+            psu_varname (str, optional): name of the psu variable.
+            str_varname (str, optional): name of the stratum variable.
+            calibration (Optional[dict]): mapping with required keys
+                ``"aux_vars"`` and ``"control"`` and optional keys
+                ``"bounds"``, ``"tol"`` and ``"max_iter"``; any other key is
+                rejected. Bootstrap designs and non-default ``rep_coefs`` are
+                rejected in this mode.
+            conservative (bool): keyword-only bool recorded with the batch.
 
         Raises:
-            AssertionError: raises an assertion error when stratum is None for a stratified design.
-            AssertionError: raises an assertion error when the replication method is not valid.
+            ValueError: illegal options or calibration contents.
+            CalibrationError: any full-sample or replicate solve fails (the
+                error identifies ``"full"`` or the replicate label).
 
         Returns:
-            pd.DataFrame: a dataframe of the replicates sample weights.
+            Union[pd.DataFrame, CalibratedReplicates]: the legacy dataframe or
+            a calibrated batch.
         """
 
+        if not isinstance(conservative, bool):
+            raise ValueError("conservative must be a boolean.")
+        if calibration is not None:
+            if not isinstance(calibration, dict):
+                raise ValueError("calibration must be a mapping or None.")
+            if self.method == RepMethod.bootstrap:
+                raise ValueError(
+                    "Calibrated replicates are not supported for the bootstrap method."
+                )
+            if rep_coefs is not False:
+                raise ValueError(
+                    "rep_coefs output cannot be requested together with calibration; "
+                    "the design coefficients are carried by CalibratedReplicates."
+                )
+
+        raw_frame = self._replicate_raw(
+            samp_weight=samp_weight,
+            psu=psu,
+            stratum=stratum,
+            rep_coefs=rep_coefs,
+            rep_prefix=rep_prefix,
+            psu_varname=psu_varname,
+            str_varname=str_varname,
+        )
+
+        if calibration is None:
+            return raw_frame
+
+        rep_prefix_resolved = self._rep_prefix(rep_prefix)
+        rep_columns = [c for c in raw_frame.columns if c.startswith(rep_prefix_resolved)]
+        if not rep_columns:  # pragma: no cover - defensive
+            raise ValueError("No replicate columns were produced by the generator.")
+        replicate_ids = np.asarray(rep_columns, dtype=object)
+        raw_rep_weights = raw_frame[rep_columns].to_numpy(dtype=np.float64)
+        base_weights = formats.numpy_array(samp_weight).astype(np.float64)
+
+        if raw_frame.shape[0] != base_weights.shape[0]:  # pragma: no cover - defensive
+            raise ValueError("Replicate generator changed the number of sample units.")
+
+        fay = self.fay_coef if self.method == RepMethod.brr else None
+        batch = calibrate_replicates(
+            samp_weight=base_weights,
+            raw_rep_weights=raw_rep_weights,
+            replicate_ids=replicate_ids,
+            calibration=calibration,
+            method=self.method,
+            fay_coef=fay,
+            rep_coefs=np.asarray(self.rep_coefs, dtype=np.float64),
+            degree_of_freedom=int(self.degree_of_freedom),
+            nb_strata=int(self.nb_strata),
+            conservative=conservative,
+        )
+        return batch
+
+    def _replicate_raw(
+        self,
+        samp_weight: Array,
+        psu: Array,
+        stratum: Optional[Array] = None,
+        rep_coefs: Union[Array, Number] = False,
+        rep_prefix: Optional[str] = None,
+        psu_varname: str = "_psu",
+        str_varname: str = "_stratum",
+    ) -> pd.DataFrame:
+        """Legacy replicate-weight construction (dataframe output)."""
         samp_weight = formats.numpy_array(samp_weight)
         psu = formats.numpy_array(psu)
         if not self.strat:
@@ -323,9 +415,8 @@ class ReplicateWeight:
             _rep_data = self._boot_replicates(psu, stratum)
         elif self.method == RepMethod.brr:
             _rep_data = self._brr_replicates(psu, stratum)
-            self.rep_coefs = list(
-                (1 / self.nb_reps * pow(1 - self.fay_coef, 2)) * np.ones(self.nb_reps)
-            )
+            # _brr_replicates already sets the design coefficients
+            # 1 / (nb_reps * (1 - fay_coef)**2); keep them unchanged.
         else:
             raise AssertionError(
                 "Replication method not recognized. Possible options are: 'bootstrap', 'brr', and 'jackknife'"

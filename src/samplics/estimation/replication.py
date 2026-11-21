@@ -1,15 +1,89 @@
 import math
+
 from typing import Any, Optional, Tuple, TypeVar, Union
 
 import numpy as np
 import pandas as pd
+
 from scipy.stats import t as student
 
 from samplics.estimation.expansion import _SurveyEstimator
 from samplics.utils.formats import numpy_array, remove_nans
 from samplics.utils.types import Array, Number, PopParam, RepMethod
 
+
 TypeRepEst = TypeVar("TypeRepEst", bound="ReplicateEstimator")
+
+
+def _method_equal(method_a: object, method_b: object) -> bool:
+    """Compare method labels whether given as RepMethod or raw strings."""
+
+    def value_of(m: object) -> str:
+        return m.value if isinstance(m, RepMethod) else str(m)
+
+    return value_of(method_a) == value_of(method_b)
+
+
+def _finite_vector(name: str, arr: object, n: int) -> np.ndarray:
+    """Validate a one-dimensional finite real input of length n."""
+
+    if isinstance(arr, bool):
+        raise ValueError(f"{name} must not be a boolean.")
+    a = numpy_array(arr)
+    if a.dtype.kind in ("b", "c", "O", "U", "S"):
+        raise ValueError(f"{name} must be a numeric array of finite reals.")
+    a = a.astype(np.float64, copy=False)
+    if a.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional.")
+    if a.shape[0] != n:
+        raise ValueError(f"{name} must have length {n} to match the calibrated batch.")
+    if not np.all(np.isfinite(a)):
+        raise ValueError(f"{name} must contain finite values only.")
+    return a
+
+
+def _assert_positive_denominators(
+    weights: np.ndarray,
+    n: int,
+    param: PopParam,
+    x: Optional[np.ndarray],
+    domain: np.ndarray,
+    where: str,
+) -> None:
+    """Reject mean/ratio runs whose denominator is zero on any reported unit.
+
+    The check covers the full sample plus every replicate and, when domains are
+    requested, every domain. Undefined variances are never replaced by zero.
+    """
+
+    if param == PopParam.total:
+        return
+    if param == PopParam.ratio:
+        if x is None:
+            raise ValueError("x must be provided for ratio estimation.")
+        weighted = weights * x[:, None] if weights.ndim == 2 else weights * x
+        totals = weighted.sum(axis=0)
+    else:  # mean (and any denominator-based parameter)
+        totals = weights.sum(axis=0)
+    if np.any(totals == 0.0) or np.any(~np.isfinite(totals)):
+        raise ZeroDivisionError(
+            f"Zero or non-finite denominator for {param.value} in {where}; "
+            "the estimate is undefined and no variance was computed."
+        )
+    if domain.shape not in ((), (0,)):
+        for d_label in np.unique(domain):
+            mask = (domain == d_label)
+            sub = weights[mask, :] if weights.ndim == 2 else weights[mask]
+            if param == PopParam.ratio:
+                sub_num = (sub * x[mask, None]) if weights.ndim == 2 else sub * x[mask]
+                d_totals = sub_num.sum(axis=0)
+            else:
+                d_totals = sub.sum(axis=0)
+            if np.any(d_totals == 0.0) or np.any(~np.isfinite(d_totals)):
+                raise ZeroDivisionError(
+                    f"Zero or non-finite denominator for {param.value} in domain "
+                    f"{d_label!r} ({where}); the domain estimate is undefined."
+                )
 
 
 class ReplicateEstimator(_SurveyEstimator):
@@ -503,3 +577,239 @@ class ReplicateEstimator(_SurveyEstimator):
                     self.stderror[key] = pow(self.variance[key], 0.5)
 
         return self
+
+    def estimate_calibrated(
+        self: TypeRepEst,
+        y: Array,
+        calibrated: Any,
+        *,
+        x: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+        domain: Optional[np.ndarray] = None,
+        conservative: bool = False,
+    ) -> TypeRepEst:
+        """Estimate total/mean/ratio from a :class:`CalibratedReplicates` batch.
+
+        The point estimate uses the calibrated full-sample weights; the
+        variance uses every calibrated replicate column. The design metadata
+        carried by the batch (replicate coefficients, Fay correction,
+        conservative convention, degrees of freedom) drive the variance
+        formulas and are validated against this estimator's construction
+        instead of being recomputed from the surviving non-zero rows.
+
+        Args:
+            y: length-n one-dimensional finite real outcome.
+            calibrated: a CalibratedReplicates produced by
+                :meth:`ReplicateWeight.replicate` with ``calibration`` set.
+            x: length-n auxiliary for ratio estimation (required then).
+            domain: length-n domain labels without missing values; the same
+                calibrated weights are masked per domain - domains are never
+                re-calibrated separately.
+            conservative: must match the batch's recorded convention.
+
+        Raises:
+            ValueError: method mismatch, wrong lengths, bad options or
+                metadata inconsistencies.
+            ZeroDivisionError: a mean/ratio denominator vanishes for the full
+                sample, any replicate or any reported domain. On any failure
+                the previous successful results on this estimator are left
+                untouched.
+
+        Returns:
+            The estimator instance, with the same result attributes and
+            :meth:`to_dataframe` support as :meth:`estimate`.
+        """
+
+        from samplics.weighting.calibrated import CalibratedReplicates
+
+        if not isinstance(calibrated, CalibratedReplicates):
+            raise ValueError(
+                "calibrated must be a CalibratedReplicates instance; use estimate() "
+                "for raw replicate arrays."
+            )
+        if not isinstance(conservative, bool):
+            raise ValueError("conservative must be a boolean.")
+        if conservative != bool(getattr(calibrated, "conservative", False)):
+            raise ValueError(
+                "conservative must match the convention recorded with the calibrated "
+                "batch."
+            )
+        if not _method_equal(self.method, calibrated.method):
+            raise ValueError(
+                f"Estimator method {self.method!r} does not match the batch method "
+                f"{calibrated.method!r}."
+            )
+        if self.param == PopParam.ratio and x is None:
+            raise ValueError("x must be provided for ratio estimation.")
+
+        full_weights = np.asarray(calibrated.full_weights, dtype=np.float64)
+        rep_weights = np.asarray(calibrated.rep_weights, dtype=np.float64)
+        n = full_weights.shape[0]
+        if rep_weights.ndim != 2 or rep_weights.shape[0] != n:
+            raise ValueError("calibrated.rep_weights must be an n-by-R matrix.")
+        nb_reps = rep_weights.shape[1]
+
+        _y = _finite_vector("y", y, n)
+        _x = numpy_array(x)
+        if _x.shape not in ((), (0,)):
+            _x = _finite_vector("x", _x, n)
+        _domain = numpy_array(domain)
+        if _domain.shape not in ((), (0,)):
+            if _domain.shape[0] != n:
+                raise ValueError("domain must have one label per sample unit.")
+            if np.issubdtype(_domain.dtype, np.floating) and np.any(np.isnan(_domain)):
+                raise ValueError("domain labels must not contain missing values.")
+            if _domain.dtype.kind == "O":
+                if any(label is None or (isinstance(label, float) and np.isnan(label))
+                       for label in _domain):
+                    raise ValueError("domain labels must not contain missing values.")
+
+        # Design metadata checks against the estimator's construction.
+        batch_coefs = np.asarray(calibrated.rep_coefs, dtype=np.float64).reshape(-1)
+        if batch_coefs.shape[0] != nb_reps:
+            raise ValueError("The batch rep_coefs must have one entry per replicate.")
+        if self.method == RepMethod.brr:
+            fay_batch = calibrated.fay_coef
+            if fay_batch is None:
+                raise ValueError("BRR batch must carry a Fay coefficient (0 for plain BRR).")
+            expected_coef = 1.0 / (nb_reps * (1.0 - fay_batch) ** 2)
+            if not np.allclose(batch_coefs, expected_coef, rtol=1e-9, atol=1e-12):
+                raise ValueError(
+                    "BRR replicate coefficients are inconsistent with the Fay coefficient."
+                )
+            if int(calibrated.degree_of_freedom) != int(calibrated.nb_strata):
+                raise ValueError(
+                    "BRR degrees of freedom must equal the number of strata."
+                )
+            if self.fay_coef is not None and not np.isclose(
+                float(self.fay_coef), float(fay_batch), rtol=0.0, atol=1e-12
+            ):
+                raise ValueError(
+                    "Estimator Fay coefficient does not match the calibrated batch."
+                )
+        elif self.method == RepMethod.jackknife:
+            if calibrated.fay_coef is not None:
+                raise ValueError("Jackknife batches must have fay_coef set to None.")
+            if not np.all(batch_coefs > 0.0) or not np.all(batch_coefs < 1.0):
+                raise ValueError("Jackknife replicate coefficients must lie in (0, 1).")
+            if int(calibrated.degree_of_freedom) <= 0:
+                raise ValueError("Jackknife degrees of freedom must be positive.")
+            if int(calibrated.degree_of_freedom) > nb_reps:
+                raise ValueError(
+                    "Jackknife degrees of freedom cannot exceed the number of replicates."
+                )
+
+        # Zero-denominator rejection before any state is mutated.
+        _assert_positive_denominators(
+            full_weights, n, self.param, _x, _domain, "the full-sample weights"
+        )
+        _assert_positive_denominators(
+            rep_weights, n, self.param, _x, _domain, "the calibrated replicate weights"
+        )
+
+        # From here on the call is valid: mirror the legacy estimate() flow so
+        # point estimates, variance formulas, CIs and to_dataframe are reused.
+        previous = {
+            "point_est": self.point_est,
+            "variance": self.variance,
+            "stderror": self.stderror,
+            "lower_ci": self.lower_ci,
+            "upper_ci": self.upper_ci,
+            "coef_var": self.coef_var,
+            "domains": self.domains,
+            "degree_of_freedom": self.degree_of_freedom,
+            "nb_reps": self.nb_reps,
+            "rep_coefs": self.rep_coefs,
+            "conservative": self.conservative,
+        }
+        try:
+            self.conservative = conservative
+            self.nb_reps = nb_reps
+            self.rep_coefs = batch_coefs
+            self.degree_of_freedom = int(calibrated.degree_of_freedom)
+            self.domains = (
+                np.unique(_domain) if _domain.shape not in ((), (0,)) else _domain
+            )
+
+            self.point_est = self._get_point(
+                y=_y, samp_weight=full_weights, x=_x, domain=_domain
+            )
+            self.variance = self._get_variance(
+                y=_y,
+                samp_weight=full_weights,
+                rep_weights=rep_weights,
+                rep_coefs=batch_coefs,
+                x=_x,
+                domain=_domain,
+                conservative=conservative,
+            )
+
+            t_quantile = student.ppf(1 - self.alpha / 2, df=self.degree_of_freedom)
+            self.lower_ci, self.upper_ci = self._get_confint(
+                self.param, self.point_est, self.variance, t_quantile
+            )
+            self.coef_var = self._get_coefvar(
+                self.param, self.point_est, self.variance
+            )
+
+            if self.domains.shape in ((), (0,)):
+                if self.param == PopParam.prop:
+                    for level in self.variance:
+                        self.stderror[level] = pow(self.variance[level], 0.5)
+                elif isinstance(self.variance, (int, float)):
+                    self.stderror = pow(self.variance, 0.5)
+            else:
+                for key in self.variance:
+                    if self.param == PopParam.prop:
+                        stderror = {}
+                        for level in self.variance[key]:
+                            stderror[level] = pow(self.variance[key][level], 0.5)
+                        self.stderror[key] = stderror
+                    else:
+                        self.stderror[key] = pow(self.variance[key], 0.5)
+        except Exception:
+            # Keep the last successful result intact after a failed call.
+            for attr, value in previous.items():
+                setattr(self, attr, value)
+            raise
+
+        return self
+
+    def to_dataframe(self, col_names: Optional[list] = None) -> pd.DataFrame:
+        """Return the latest estimates as a dataframe.
+
+        Mirrors :meth:`TaylorEstimator.to_dataframe` using the same column
+        layout and :func:`~samplics.utils.formats.dict_to_dataframe` helper, so
+        calibrated and uncalibrated replicate runs produce identical output
+        shapes.
+        """
+
+        from samplics.utils.formats import dict_to_dataframe
+
+        if self.point_est in (None, {}):
+            raise AssertionError("No estimates yet. Must first run an estimate method.")
+
+        if col_names is None:
+            col_names = [
+                "_param",
+                "_domain",
+                "_estimate",
+                "_stderror",
+                "_lci",
+                "_uci",
+                "_cv",
+            ]
+            if self.domains is None or self.domains.shape in ((), (0,)):
+                col_names.pop(1)
+        elif len(col_names) != (6 if self.domains is None or self.domains.shape in ((), (0,)) else 7):
+            raise AssertionError("col_names has the wrong number of columns for this run.")
+
+        est_df = dict_to_dataframe(
+            col_names,
+            self.point_est,
+            self.stderror,
+            self.lower_ci,
+            self.upper_ci,
+            self.coef_var,
+        )
+        est_df.iloc[:, 0] = self.param.value if hasattr(self.param, "value") else str(self.param)
+        return est_df

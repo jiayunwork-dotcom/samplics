@@ -17,8 +17,8 @@ import pandas as pd
 import polars as pl
 
 from samplics.utils import checks, formats
-from samplics.utils.types import (Array, DictStrInt, DictStrNum, Number,
-                                  StringNumber)
+from samplics.utils.types import Array, DictStrInt, DictStrNum, Number, StringNumber
+from samplics.weighting.calibration import calibrate_bounded
 
 
 class SampleWeight:
@@ -716,6 +716,66 @@ class SampleWeight:
         self.adj_method = "calibration"
 
         return calib_weight
+
+    @staticmethod
+    def calibrate_bounded(
+        samp_weight: Array,
+        aux_vars: Array,
+        control: Array,
+        *,
+        bounds: tuple[float, float] = (0.2, 5.0),
+        tol: float = 1e-9,
+        max_iter: int = 500,
+    ) -> np.ndarray:
+        """Bounded chi-square calibration returning an independent weight array.
+
+        Solves
+
+        .. math::
+            \\min_{w}\\;\\sum_{i:d_i>0}\\frac{(w_i-d_i)^2}{d_i}
+            \\quad\\text{s.t.}\\quad
+            X^{\\top}w=\\text{control},\\;
+            l\\,d_i\\le w_i\\le u\\,d_i,\\;
+            w_i=0\\;(d_i=0),
+
+        where ``d = samp_weight``. Rows with zero base weight are structural
+        zeros and stay zero. See
+        :func:`samplics.weighting.calibration.calibrate_bounded` for the full
+        description of the algorithm, the optimality stopping scale and the
+        meaning of :class:`~samplics.weighting.CalibrationError`.
+
+        Args:
+            samp_weight: length-n finite non-negative base weights with at
+                least one positive entry.
+            aux_vars: n-by-p finite real auxiliary matrix (negative values,
+                disparate column scales, duplicates and dependent columns are
+                allowed).
+            control: length-p finite population totals.
+            bounds: ``(lower, upper)`` finite positive pair with
+                ``lower <= 1 <= upper`` and ``lower < upper``.
+            tol: strictly positive finite tolerance; the per-column allowance
+                is ``tol * max(1, abs(control[j]))`` and the same order
+                governs the optimality measure.
+            max_iter: non-boolean positive iteration budget.
+
+        Returns:
+            A new length-n ``float64`` array; inputs are never modified.
+
+        Raises:
+            ValueError: invalid inputs or options.
+            CalibrationError: ``"infeasible"`` (with a checkable Farkas
+                certificate), ``"iteration_limit"`` or
+                ``"numerical_failure"``.
+        """
+
+        return calibrate_bounded(
+            formats.numpy_array(samp_weight),
+            formats.numpy_array(aux_vars),
+            formats.numpy_array(control),
+            bounds=bounds,
+            tol=tol,
+            max_iter=max_iter,
+        )
 
     def trim(
         self,
