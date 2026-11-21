@@ -1,3 +1,5 @@
+from samplics.sampling.conditional_poisson import (ConditionalPoissonDesign,
+                                                   SelectionResult)
 from samplics.sampling.power_functions import (calculate_power,
                                                calculate_power_prop,
                                                power_for_one_mean,
@@ -20,6 +22,8 @@ __all__ = [
     "calculate_ss_wald_mean",
     "power_for_one_proportion",
     "power_for_one_mean",
+    "ConditionalPoissonDesign",
+    "SelectionResult",
     "SampleSelection",
     "SampleSize",
     "SampleSizeMeanOneSample",

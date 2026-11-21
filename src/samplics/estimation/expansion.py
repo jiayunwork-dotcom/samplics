@@ -29,7 +29,6 @@ from samplics.utils.formats import (dict_to_dataframe, fpc_as_dict,
 from samplics.utils.types import (Array, Number, PopParam, QuantileMethod,
                                   Series, SinglePSUEst, StringNumber)
 
-
 class _SurveyEstimator:
     """General approach for sample estimation of linear parameters."""
 
@@ -1024,6 +1023,281 @@ class TaylorEstimator(_SurveyEstimator):
                 self.stderror[b] = by_est.stderror
                 self.lower_ci[b] = by_est.lower_ci
                 self.upper_ci[b] = by_est.upper_ci
+
+    # ------------------------------------------------------------------
+    # Design-aware estimation for conditional Poisson selection results
+    # ------------------------------------------------------------------
+
+    def estimate_design(
+        self,
+        y: Array,
+        selection: "SelectionResult",
+        *,
+        x: Optional[Array] = None,
+        domain: Optional[Array] = None,
+    ) -> None:
+        """Estimate a total, mean or ratio from a conditional Poisson draw.
+
+        The variance follows the stratified Sen-Yates-Grundy estimator of the
+        fixed-size design that produced ``selection``.  Unlike :meth:`estimate`:
+
+        * weights are taken from the design (``1 / pi_i`` with ``pi_i`` the
+          final inclusion probability);
+        * ``mean`` divides the Horvitz-Thompson total by the *known* number of
+          population units in the design, not by the sum of weights;
+        * a domain mean divides by the number of frame units in that domain, so
+          ``domain`` must cover the whole frame (one label per frame row);
+        * ``ratio`` uses the ratio of weighted totals, overall or by domain.
+
+        A non-census stratum with a single random selection makes the variance
+        inestimable and the whole call is rejected.  On any failure the
+        estimator keeps its previous successful results.
+        """
+        from samplics.sampling.conditional_poisson import SelectionResult
+
+        if not isinstance(selection, SelectionResult):
+            raise TypeError("selection must be a SelectionResult instance.")
+        if self.param not in (PopParam.total, PopParam.mean, PopParam.ratio):
+            raise ValueError(
+                "estimate_design supports only total, mean and ratio parameters."
+            )
+
+        design = selection.design
+        positions = selection.indices
+        sample_size = positions.size
+        if sample_size == 0:
+            raise ValueError("The selection result is empty.")
+
+        y_values = numpy_array(y)
+        if y_values.ndim != 1 or y_values.size != sample_size:
+            raise ValueError("y must be a one-dimensional array following selection order.")
+        y_values = np.asarray(y_values, dtype=float)
+        if not np.all(np.isfinite(y_values)):
+            raise ValueError("y must contain only finite values.")
+
+        x_values: Optional[np.ndarray] = None
+        if self.param == PopParam.ratio:
+            if x is None:
+                raise ValueError("x must be provided for ratio estimation.")
+            x_values = numpy_array(x)
+            if x_values.ndim != 1 or x_values.size != sample_size:
+                raise ValueError(
+                    "x must be a one-dimensional array following selection order."
+                )
+            x_values = np.asarray(x_values, dtype=float)
+            if not np.all(np.isfinite(x_values)):
+                raise ValueError("x must contain only finite values.")
+        elif x is not None:
+            x_values = np.asarray(numpy_array(x), dtype=float)
+            if x_values.ndim != 1 or x_values.size != sample_size:
+                raise ValueError(
+                    "x must be a one-dimensional array following selection order."
+                )
+
+        domain_labels: Optional[np.ndarray] = None
+        domain_mask: Optional[np.ndarray] = None
+        if domain is not None:
+            domain_labels = numpy_array(domain)
+            if domain_labels.ndim != 1 or domain_labels.size != design.frame_size:
+                raise ValueError(
+                    "domain must be a one-dimensional array covering the full frame."
+                )
+            for value in domain_labels:
+                if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+                    raise ValueError("domain must not contain missing labels.")
+            domain_mask = np.asarray(domain_labels)[positions]
+
+        inclusion = np.asarray(design.inclusion_probabilities, dtype=float)[positions]
+        if (inclusion <= 0.0).any() or not np.all(np.isfinite(inclusion)):
+            raise ValueError("The design produced invalid inclusion probabilities.")
+
+        # Compute everything into local variables first; assign to self only
+        # after every check has passed so failures keep the previous results.
+        point, variance, domains, degree = self._design_estimates(
+            design=design,
+            positions=positions,
+            y=y_values,
+            x=x_values,
+            domain_labels=domain_labels,
+            domain_mask=domain_mask,
+            inclusion=inclusion,
+        )
+
+        alpha = self.alpha
+        t_quantile = (
+            student.ppf(1 - alpha / 2, df=degree) if degree > 0 else float("nan")
+        )
+
+        def interval(estimate: float, var: float) -> tuple[float, float, float]:
+            if var < 0.0 or not np.isfinite(var):
+                raise ValueError("The variance estimate is invalid.")
+            standard_error = math.sqrt(var)
+            if degree > 0:
+                lower = estimate - t_quantile * standard_error
+                upper = estimate + t_quantile * standard_error
+            else:
+                # Only deterministic (variance zero) results may have a
+                # degenerate interval.
+                if var != 0.0:
+                    raise ValueError(
+                        "Cannot form a confidence interval with zero degrees of freedom."
+                    )
+                lower = upper = estimate
+            return standard_error, lower, upper
+
+        if domains is None:
+            stderror, lower, upper = interval(point, variance)
+            coef_var = stderror / point if point != 0 else float("nan")
+            results = {
+                "point_est": point,
+                "variance": variance,
+                "stderror": stderror,
+                "lower_ci": lower,
+                "upper_ci": upper,
+                "coef_var": coef_var,
+            }
+        else:
+            stderror_d: dict[Any, float] = {}
+            lower_d: dict[Any, float] = {}
+            upper_d: dict[Any, float] = {}
+            coef_var_d: dict[Any, float] = {}
+            for label in domains:
+                standard_error, low, high = interval(point[label], variance[label])
+                stderror_d[label] = standard_error
+                lower_d[label] = low
+                upper_d[label] = high
+                coef_var_d[label] = (
+                    standard_error / point[label] if point[label] != 0 else float("nan")
+                )
+            results = {
+                "point_est": dict(point),
+                "variance": dict(variance),
+                "stderror": stderror_d,
+                "lower_ci": lower_d,
+                "upper_ci": upper_d,
+                "coef_var": coef_var_d,
+            }
+
+        self.point_est = results["point_est"]
+        self.variance = results["variance"]
+        self.stderror = results["stderror"]
+        self.lower_ci = results["lower_ci"]
+        self.upper_ci = results["upper_ci"]
+        self.coef_var = results["coef_var"]
+        self.covariance = {}
+        self.deff = {}
+        self.domains = None if domains is None else list(domains)
+        self.strata = None
+        self.single_psu_strata = None
+        self.nb_strata = len(design.strata)
+        self.nb_psus = int(sample_size)
+        self.degree_of_freedom = degree
+        self.as_factor = False
+        self.method = "taylor"
+
+    def _design_estimates(
+        self,
+        *,
+        design: Any,
+        positions: np.ndarray,
+        y: np.ndarray,
+        x: Optional[np.ndarray],
+        domain_labels: Optional[np.ndarray],
+        domain_mask: Optional[np.ndarray],
+        inclusion: np.ndarray,
+    ) -> tuple[Any, Any, Optional[list], int]:
+        weights = 1.0 / inclusion
+        design_size = design.frame_size
+        degree = design.design_degrees_of_freedom(positions)
+
+        if domain_mask is None:
+            population_size = float(design_size)
+            point = self._design_point(design, positions, y, x, weights, population_size)
+            variance = self._design_variance(
+                design, positions, y, x, weights, inclusion, point, population_size
+            )
+            return point, variance, None, degree
+
+        unique_domains = list(dict.fromkeys(domain_labels.tolist()))
+        counts = {label: int(np.sum(domain_labels == label)) for label in unique_domains}
+        sampled = set(domain_mask.tolist())
+        missing = [label for label in unique_domains if label not in sampled]
+        if missing:
+            raise ValueError(
+                "Every population domain must contain at least one sampled unit; "
+                f"empty domains: {missing}."
+            )
+
+        points: dict[Any, float] = {}
+        variances: dict[Any, float] = {}
+        for label in unique_domains:
+            mask = domain_mask == label
+            y_d = np.where(mask, y, 0.0)
+            x_d = None if x is None else np.where(mask, x, 0.0)
+            population_size = float(counts[label])
+            point_d = self._design_point(
+                design, positions, y_d, x_d, weights, population_size
+            )
+            variance_d = self._design_variance(
+                design, positions, y_d, x_d, weights, inclusion, point_d, population_size
+            )
+            points[label] = point_d
+            variances[label] = variance_d
+        return points, variances, unique_domains, degree
+
+    def _design_point(
+        self,
+        design: Any,
+        positions: np.ndarray,
+        y: np.ndarray,
+        x: Optional[np.ndarray],
+        weights: np.ndarray,
+        population_size: float,
+    ) -> float:
+        total_y = float(np.sum(weights * y))
+        if self.param == PopParam.total:
+            return total_y
+        if self.param == PopParam.mean:
+            return total_y / population_size
+        assert x is not None
+        total_x = float(np.sum(weights * x))
+        if total_x == 0.0:
+            raise ValueError("Zero denominator in the ratio estimate.")
+        return total_y / total_x
+
+    def _design_variance(
+        self,
+        design: Any,
+        positions: np.ndarray,
+        y: np.ndarray,
+        x: Optional[np.ndarray],
+        weights: np.ndarray,
+        inclusion: np.ndarray,
+        point: float,
+        population_size: float,
+    ) -> float:
+        """SYG variance of the linearised estimator.
+
+        ``syg_variance`` divides the supplied unit values by their first-order
+        inclusion probabilities, so raw linearised values are passed here.  The
+        scale follows the parameter: totals are reported directly, means are
+        divided by the squared known population size, and ratios divide the
+        residual (``y - R x``) by the estimated denominator total ``X``.
+        """
+        if self.param == PopParam.total:
+            linearized = y
+            scale = 1.0
+        elif self.param == PopParam.mean:
+            linearized = y
+            scale = 1.0 / (population_size**2)
+        else:
+            assert x is not None
+            total_x = float(np.sum(weights * x))
+            if total_x == 0.0:
+                raise ValueError("Zero denominator in the ratio variance.")
+            linearized = (y - point * x) / total_x
+            scale = 1.0
+        return design.syg_variance(positions, linearized) * scale
 
     def to_dataframe(
         self,

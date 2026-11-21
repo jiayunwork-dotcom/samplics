@@ -108,6 +108,7 @@ class SelectMethod(Enum):
     pps_rs = "PPS Rao-Sampford"
     pps_sys = "PPS Systematic"
     pps_wr = "PPS with replacement"
+    conditional_poisson = "Conditional Poisson"
     grs = "General"
 
 

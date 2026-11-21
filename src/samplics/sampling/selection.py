@@ -23,11 +23,46 @@ from typing import Optional, Union
 import numpy as np
 import pandas as pd
 
-from samplics.utils.errors import CertaintyError, MethodError, ProbError
+from samplics.sampling.conditional_poisson import ConditionalPoissonDesign
+from samplics.utils.errors import (CertaintyError, MethodError, ProbError)
 from samplics.utils.formats import (data_to_dict, numpy_array, remove_nans,
                                     sample_units)
 from samplics.utils.types import (Array, DictStrBool, DictStrFloat, DictStrInt,
                                   DictStrNum, Number, SelectMethod)
+
+_CONDITIONAL_POISSON_CONFLICTS = (
+    "mos",
+    "samp_rate",
+    "probs",
+)
+
+
+def _is_integer_scalar(value: object) -> bool:
+    return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
+
+
+def _unique_labels(labels: np.ndarray) -> list:
+    """Unique labels preserving first-appearance order, as Python scalars."""
+    seen: list = []
+    for value in labels:
+        if value not in seen:
+            seen.append(value)
+    return seen
+
+
+def _contains_boolean(values: object) -> bool:
+    """Whether any element is a Python or NumPy boolean."""
+    if isinstance(values, (bool, np.bool_)):
+        return True
+    if isinstance(values, np.ndarray):
+        if values.dtype.kind == "b":
+            return True
+        if values.dtype.kind == "O" and values.ndim == 1:
+            return any(isinstance(value, (bool, np.bool_)) for value in values)
+        return False
+    if isinstance(values, (list, tuple)):
+        return any(isinstance(value, (bool, np.bool_)) for value in values)
+    return False
 
 
 @dataclass
@@ -638,6 +673,211 @@ class SampleSelection:
 
         return sample, hits
 
+    @staticmethod
+    def _validate_frame_and_parameters(
+        samp_unit: Array,
+        probabilities: Array,
+        stratum: Optional[Array],
+    ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray], bool]:
+        """Validate and copy the design inputs. Raises ValueError on failure."""
+        units = numpy_array(samp_unit)
+        units = np.asarray(units)
+        if units.ndim != 1:
+            raise ValueError("samp_unit must be a one-dimensional array of unit identifiers.")
+        if units.size == 0:
+            raise ValueError("samp_unit must contain at least one unit.")
+        if units.dtype.kind not in ("U", "S", "O", "i", "u"):
+            raise ValueError("samp_unit must contain string or integer identifiers.")
+        if units.dtype.kind == "O":
+            normalized = []
+            for value in units:
+                value = value.item() if hasattr(value, "item") else value
+                if isinstance(value, (bool, np.bool_)) or not isinstance(value, (str, int)):
+                    raise ValueError(
+                        "samp_unit must contain string or integer identifiers."
+                    )
+                normalized.append(value)
+            units = np.asarray(normalized, dtype=object)
+        elif units.dtype.kind == "S":
+            units = units.astype(str)
+        units = np.array(units, copy=True)
+        for value in units:
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError("Boolean unit identifiers are not accepted.")
+        if len(set(units.tolist())) != units.size:
+            raise ValueError("samp_unit must contain unique unit identifiers.")
+
+        if _contains_boolean(probabilities):
+            raise ValueError("probabilities must be real numbers, not booleans.")
+        probs = np.asarray(probabilities)
+        if probs.dtype.kind == "b":
+            raise ValueError("probabilities must be real numbers, not booleans.")
+        if probs.dtype.kind == "O":
+            for value in probs.ravel():
+                if isinstance(value, (bool, np.bool_)) or not isinstance(
+                    value, (int, float, np.integer, np.floating)
+                ):
+                    raise ValueError("probabilities must be real numbers.")
+            probs = probs.astype(float)
+        elif probs.dtype.kind not in ("i", "u", "f"):
+            raise ValueError("probabilities must be real numbers.")
+        else:
+            probs = np.asarray(probabilities, dtype=float)
+        if probs.ndim != 1 or probs.size != units.size:
+            raise ValueError("probabilities must be a one-dimensional array aligned with samp_unit.")
+        if not np.all(np.isfinite(probs)):
+            raise ValueError("probabilities must be finite.")
+        if (probs <= 0.0).any() or (probs > 1.0).any():
+            raise ValueError("probabilities must lie in the interval (0, 1].")
+        probs = np.array(probs, dtype=float, copy=True)
+
+        if stratum is None:
+            return units, probs, None, False
+
+        labels = np.asarray(stratum)
+        if labels.ndim != 1 or labels.size != units.size:
+            raise ValueError("stratum must be a one-dimensional array aligned with samp_unit.")
+        if labels.dtype.kind not in ("U", "S", "O", "i", "u", "f"):
+            raise ValueError("stratum must contain string or integer labels.")
+        if labels.dtype.kind == "f" and not np.all(np.isfinite(labels)):
+            raise ValueError("stratum must not contain missing labels.")
+        normalized_labels = np.empty(labels.size, dtype=object)
+        for index, value in enumerate(labels):
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError("stratum must contain string or integer labels.")
+            if isinstance(value, str):
+                if value in ("", "nan", "None"):
+                    raise ValueError("stratum must not contain missing labels.")
+                normalized_labels[index] = value
+            elif isinstance(value, (int, np.integer)):
+                normalized_labels[index] = int(value)
+            elif isinstance(value, (float, np.floating)):
+                if not np.isfinite(value):
+                    raise ValueError("stratum must not contain missing labels.")
+                normalized_labels[index] = float(value)
+            else:
+                raise ValueError("stratum must contain string or integer labels.")
+        return units, probs, normalized_labels, True
+
+    @staticmethod
+    def _validate_sample_size(
+        samp_size: Union[DictStrInt, int],
+        stratum: Optional[np.ndarray],
+        units: np.ndarray,
+        probabilities: np.ndarray,
+    ) -> Union[int, dict]:
+        if stratum is None:
+            if not _is_integer_scalar(samp_size):
+                raise ValueError("samp_size must be a non-boolean integer when not stratified.")
+            size = int(samp_size)
+            labels = np.zeros(units.size, dtype=np.intp)
+            mapping = {0: size}
+        else:
+            if not isinstance(samp_size, dict) or isinstance(samp_size, bool):
+                raise ValueError(
+                    "samp_size must be a dictionary mapping every stratum to an integer."
+                )
+            labels = stratum
+            observed = _unique_labels(labels)
+            provided = list(samp_size.keys())
+            if len(provided) != len(observed) or any(
+                key not in observed for key in provided
+            ) or any(key not in provided for key in observed):
+                raise ValueError(
+                    "samp_size must cover exactly the strata present in stratum."
+                )
+            mapping = {}
+            for key, value in samp_size.items():
+                if not _is_integer_scalar(value):
+                    raise ValueError("samp_size values must be non-boolean integers.")
+                mapping[key] = int(value)
+
+        for label in _unique_labels(labels):
+            mask = labels == label
+            population = int(mask.sum())
+            size = mapping[label]
+            if size < 1 or size > population:
+                raise ValueError(
+                    f"Sample size must be between 1 and the stratum population size "
+                    f"(stratum {label!r})."
+                )
+            probability = probabilities[mask]
+            nb_mandatory = int((probability == 1.0).sum())
+            remaining = size - nb_mandatory
+            nb_optional = population - nb_mandatory
+            if remaining < 0 or remaining > nb_optional:
+                raise ValueError(
+                    "The number of certainty (probability 1) units is incompatible "
+                    f"with the sample size of stratum {label!r}."
+                )
+            if nb_optional > 0 and remaining == 0:
+                raise ValueError(
+                    "Zero remaining selections with non-certainty units present would "
+                    f"assign zero inclusion probability (stratum {label!r})."
+                )
+        return int(samp_size) if stratum is None else mapping
+
+    @staticmethod
+    def _check_conditional_poisson_conflicts(**options: object) -> None:
+        for name in _CONDITIONAL_POISSON_CONFLICTS:
+            if options.get(name) is not None:
+                raise ValueError(
+                    f"The option '{name}' is not supported with conditional Poisson "
+                    "sampling; provide probabilities instead."
+                )
+        if options.get("remove_nan", False):
+            raise ValueError(
+                "remove_nan=True is not supported with conditional Poisson sampling."
+            )
+
+    def prepare_design(
+        self,
+        samp_unit: Array,
+        samp_size: Union[DictStrInt, int],
+        *,
+        probabilities: Array,
+        stratum: Optional[Array] = None,
+        mos: Optional[Array] = None,
+        samp_rate: Optional[Union[DictStrFloat, float]] = None,
+        probs: Optional[Array] = None,
+        remove_nan: bool = False,
+    ) -> ConditionalPoissonDesign:
+        """Prepare a conditional Poisson design without sampling.
+
+        Args:
+            samp_unit: non-empty, unique one-dimensional unit identifiers.
+            samp_size: integer sample size, or a mapping stratum -> integer when
+                stratified.  Must exactly cover the observed strata.
+            probabilities: per-row Bernoulli parameters in (0, 1], aligned with
+                ``samp_unit``.  These are the pre-conditioning parameters, not
+                the final inclusion probabilities.
+            stratum: optional equal-length stratum labels without missing values.
+            mos, samp_rate, probs: not supported; passing any raises ValueError.
+            remove_nan: not supported; ``True`` raises ValueError.
+
+        Returns:
+            ConditionalPoissonDesign: reusable exact design.  No random numbers
+            are consumed and the NumPy global random state is left untouched.
+        """
+        if self.method != SelectMethod.conditional_poisson:
+            raise MethodError(
+                "prepare_design() requires SelectMethod.conditional_poisson."
+            )
+        self._check_conditional_poisson_conflicts(
+            mos=mos, samp_rate=samp_rate, probs=probs, remove_nan=remove_nan
+        )
+        units, probs_validated, labels, stratified = self._validate_frame_and_parameters(
+            samp_unit, probabilities, stratum
+        )
+        size = self._validate_sample_size(samp_size, labels, units, probs_validated)
+        return ConditionalPoissonDesign(
+            samp_unit=units,
+            probabilities=probs_validated,
+            sample_size=size,
+            stratum=labels,
+            stratified=stratified,
+        )
+
     def inclusion_probs(
         self,
         samp_unit: np.ndarray,
@@ -645,7 +885,24 @@ class SampleSelection:
         stratum: Optional[np.ndarray] = None,
         mos: Optional[np.ndarray] = None,
         samp_rate: Optional[Union[DictStrFloat, float]] = None,
+        *,
+        probabilities: Optional[Array] = None,
     ) -> np.ndarray:
+        if probabilities is not None:
+            return self._conditional_inclusion_probs(
+                samp_unit=samp_unit,
+                samp_size=samp_size,
+                stratum=stratum,
+                mos=mos,
+                samp_rate=samp_rate,
+                probabilities=probabilities,
+            )
+        if self.method == SelectMethod.conditional_poisson:
+            raise MethodError(
+                "Conditional Poisson inclusion probabilities require the "
+                "'probabilities' argument."
+            )
+
         samp_unit = sample_units(samp_unit, unique=True)
 
         samp_size_temp: Union[DictStrInt, int]
@@ -690,6 +947,85 @@ class SampleSelection:
     def joint_inclusion_probs(self) -> None:
         pass
 
+    def _design_from_arguments(
+        self,
+        samp_unit: Array,
+        samp_size: Optional[Union[DictStrInt, int]],
+        stratum: Optional[Array],
+        probabilities: Array,
+    ) -> ConditionalPoissonDesign:
+        if samp_size is None:
+            raise ValueError("samp_size must be provided for conditional Poisson sampling.")
+        return self.prepare_design(
+            samp_unit=samp_unit,
+            samp_size=samp_size,
+            probabilities=probabilities,
+            stratum=stratum,
+        )
+
+    def _conditional_inclusion_probs(
+        self,
+        samp_unit: Array,
+        samp_size: Optional[Union[DictStrInt, int]],
+        stratum: Optional[Array],
+        mos: Optional[Array],
+        samp_rate: Optional[Union[DictStrFloat, float]],
+        probabilities: Array,
+    ) -> np.ndarray:
+        if self.method != SelectMethod.conditional_poisson:
+            raise MethodError(
+                "The 'probabilities' argument is only supported for "
+                "SelectMethod.conditional_poisson."
+            )
+        self._check_conditional_poisson_conflicts(
+            mos=mos, samp_rate=samp_rate, probs=None, remove_nan=False
+        )
+        design = self._design_from_arguments(samp_unit, samp_size, stratum, probabilities)
+        return design.inclusion_probabilities
+
+    def _conditional_select(
+        self,
+        samp_unit: Array,
+        samp_size: Optional[Union[DictStrInt, int]],
+        stratum: Optional[Array],
+        mos: Optional[Array],
+        samp_rate: Optional[Union[DictStrFloat, float]],
+        probs: Optional[Array],
+        probabilities: Array,
+        random_state: Optional[Union[int, np.random.Generator]],
+        to_dataframe: bool,
+        sample_only: bool,
+        shuffle: bool,
+    ) -> Union[tuple[np.ndarray, np.ndarray, np.ndarray], pd.DataFrame]:
+        self._check_conditional_poisson_conflicts(
+            mos=mos, samp_rate=samp_rate, probs=probs, remove_nan=False
+        )
+        if shuffle:
+            raise ValueError("shuffle is not supported with conditional Poisson sampling.")
+        design = self._design_from_arguments(samp_unit, samp_size, stratum, probabilities)
+        result = design.draw(random_state=random_state)
+
+        hits = np.zeros(design.frame_size, dtype=int)
+        hits[result.indices] = 1
+        sample = hits.astype(bool)
+        final_probs = design.inclusion_probabilities
+
+        if to_dataframe:
+            frame = self._to_dataframe(
+                samp_unit=design.samp_unit,
+                stratum=np.array(None) if design.stratum is None else design.stratum,
+                mos=np.array(None),
+                sample=sample,
+                hits=hits,
+                probs=final_probs,
+            )
+            if sample_only:
+                return frame.loc[frame["_sample"] == 1].reset_index(drop=True)
+            return frame
+        if sample_only:
+            return sample[sample], hits[sample], final_probs[sample]
+        return sample, hits, final_probs
+
     def select(
         self,
         samp_unit: Array,
@@ -702,7 +1038,36 @@ class SampleSelection:
         to_dataframe: bool = False,
         sample_only: bool = False,
         remove_nan: bool = False,
+        *,
+        probabilities: Optional[Array] = None,
+        random_state: Optional[Union[int, np.random.Generator]] = None,
     ) -> Union[tuple[np.ndarray, np.ndarray, np.ndarray], pd.DataFrame]:
+        if probabilities is not None:
+            if remove_nan:
+                raise ValueError(
+                    "remove_nan=True is not supported with conditional Poisson sampling."
+                )
+            return self._conditional_select(
+                samp_unit=samp_unit,
+                samp_size=samp_size,
+                stratum=stratum,
+                mos=mos,
+                samp_rate=samp_rate,
+                probs=probs,
+                probabilities=probabilities,
+                random_state=random_state,
+                to_dataframe=to_dataframe,
+                sample_only=sample_only,
+                shuffle=shuffle,
+            )
+        if self.method == SelectMethod.conditional_poisson:
+            raise MethodError(
+                "Conditional Poisson sampling requires the 'probabilities' argument."
+            )
+        if random_state is not None:
+            raise ValueError(
+                "random_state is only supported when 'probabilities' is provided."
+            )
         if samp_size is not None and samp_rate is not None:
             raise AssertionError(
                 """Both samp_size and samp_rate are provided.

@@ -10,7 +10,7 @@ sample weights.
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,9 @@ import polars as pl
 from samplics.utils import checks, formats
 from samplics.utils.types import Array, DictStrInt, DictStrNum, Number, StringNumber
 from samplics.weighting.calibration import calibrate_bounded
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from samplics.sampling.conditional_poisson import SelectionResult
 
 
 class SampleWeight:
@@ -80,6 +83,32 @@ class SampleWeight:
         relvar_w = np.power(samp_weight - mean_w, 2) / mean_w**2
 
         return float(1 + np.mean(relvar_w))
+
+    @staticmethod
+    def from_selection(result: "SelectionResult") -> np.ndarray:
+        """Return the base design weights induced by a selection result.
+
+        The weight of every selected unit is the reciprocal of its *final*
+        first-order inclusion probability under the design that produced the
+        draw.  The Bernoulli parameters supplied when the design was prepared
+        are not used here because they differ from the conditional inclusion
+        probabilities.
+
+        Args:
+            result: the :class:`samplics.sampling.SelectionResult` returned by
+                ``ConditionalPoissonDesign.draw``.
+
+        Returns:
+            np.ndarray: base weights in the order of ``result.samp_unit``.
+        """
+        probabilities = np.asarray(result.inclusion_probabilities, dtype=float)
+        if probabilities.size == 0:
+            return np.empty(0, dtype=float)
+        if not np.all(np.isfinite(probabilities)):
+            raise ValueError("Selection result contains non-finite inclusion probabilities.")
+        if (probabilities <= 0.0).any() or (probabilities > 1.0).any():
+            raise ValueError("Inclusion probabilities must lie in the interval (0, 1].")
+        return 1.0 / probabilities
 
     def calculate_deff_weight(
         self, samp_weight: Array, domain: Optional[np.ndarray] = None

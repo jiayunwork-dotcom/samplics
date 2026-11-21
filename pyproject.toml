@@ -56,6 +56,9 @@ exclude = '''
 
 [tool.pytest.ini_options]
 addopts = "--ignore=tests/apis --ignore=tests/sae --ignore=tests/types"
+markers = [
+    "slow: performance and memory guardrails that take several seconds",
+]
 
 # testpaths = ["tests"]
 
