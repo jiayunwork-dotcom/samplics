@@ -169,3 +169,83 @@ def test_single_psu():
     single_psu_strata = get_single_psu_strata(stratum=strat, psu=psu)
     assert 41 in single_psu_strata
     assert 55 in single_psu_strata
+
+
+"""Tests for the shared PSU-identity tool used by the variance estimators."""
+
+import numpy as np
+
+from samplics.utils.basic_functions import psu_identity
+
+
+def _partition(codes):
+    """Groups of row indices, one per identity code."""
+    return {c: set(np.flatnonzero(codes == c)) for c in np.unique(codes)}
+
+
+def test_psu_identity_pairs_stratum_and_psu():
+    stratum = np.array(["A", "A", "B", "B", "B"])
+    psu = np.array([1, 1, 1, 1, 2])
+    codes = psu_identity(stratum, psu)
+    # (A,1), (B,1), (B,2): three distinct units even though psu "1" repeats
+    assert np.unique(codes).size == 3
+    assert codes[0] == codes[1]
+    assert codes[2] == codes[3]
+    assert codes[1] != codes[2]  # same psu label, different stratum
+    assert codes[3] != codes[4]
+
+
+def test_psu_identity_partition_invariant_to_row_order():
+    stratum = np.array(["A", "A", "B", "B", "B"])
+    psu = np.array([1, 1, 1, 1, 2])
+    order = np.array([3, 0, 4, 1, 2])
+    codes = psu_identity(stratum, psu)
+    codes_reordered = psu_identity(stratum[order], psu[order])
+    # align the reordered codes back to the original row positions
+    aligned = np.empty_like(codes_reordered)
+    aligned[order] = codes_reordered
+    # same partition: two rows share a unit iff they share one after reordering
+    for i in range(stratum.size):
+        for j in range(stratum.size):
+            assert (codes[i] == codes[j]) == (aligned[i] == aligned[j])
+
+
+def test_psu_identity_partition_invariant_to_label_renaming():
+    stratum = np.array(["A", "A", "B", "B", "B"])
+    psu = np.array([1, 1, 1, 1, 2])
+    psu_renamed = np.array([101, 101, 201, 201, 202])
+    assert _partition(psu_identity(stratum, psu)) == _partition(
+        psu_identity(stratum, psu_renamed)
+    )
+
+
+def test_psu_identity_without_psu_means_one_unit_per_row():
+    codes = psu_identity(np.array(["A", "A", "B"]), np.array(()))
+    assert np.unique(codes).size == 3
+
+
+def test_psu_identity_without_stratum_uses_psu_labels():
+    codes = psu_identity(np.array(()), np.array([7, 7, 9]))
+    assert np.unique(codes).size == 2
+    assert codes[0] == codes[1]
+
+
+def test_psu_identity_int_and_object_labels():
+    assert np.unique(psu_identity(np.array([1, 1, 2, 2]), np.array([1, 1, 1, 1]))).size == 2
+    stratum_obj = np.array(["A", "A", "B", "B"], dtype=object)
+    assert np.unique(psu_identity(stratum_obj, np.array([1, 1, 1, 1]))).size == 2
+
+
+def test_get_single_psu_strata_without_psu_counts_rows():
+    # with no psu information each observation is a unit: a stratum with a
+    # single row is a singleton stratum
+    assert (get_single_psu_strata(np.array([1, 1, 2, 3, 3]), np.array(())) == [2]).all()
+    assert get_single_psu_strata(np.array([1, 1, 2, 2]), np.array(())) is None
+
+
+def test_get_single_psu_strata_pairs():
+    # stratum 2 has psus {1, 2}; stratum 3 has one psu even though its label
+    # also appears in stratum 2
+    stratum = np.array([1, 1, 2, 2, 2, 2, 3, 3])
+    psu = np.array([1, 2, 1, 1, 2, 2, 1, 1])
+    assert (get_single_psu_strata(stratum, psu) == [3]).all()

@@ -21,11 +21,12 @@ import numpy as np
 import pandas as pd
 from scipy.stats import t as student
 
-from samplics.utils.basic_functions import get_single_psu_strata
+from samplics.utils.basic_functions import get_single_psu_strata, psu_identity
 from samplics.utils.checks import (_certainty_singleton, _combine_strata,
-                                   _raise_singleton_error, _skip_singleton)
-from samplics.utils.formats import (dict_to_dataframe, fpc_as_dict,
-                                    numpy_array, remove_nans)
+                                   _raise_singleton_error, _skip_singleton,
+                                   _validate_fpc)
+from samplics.utils.formats import (dict_to_dataframe, numpy_array,
+                                    remove_nans)
 from samplics.utils.types import (Array, Number, PopParam, QuantileMethod,
                                   Series, SinglePSUEst, StringNumber)
 
@@ -860,9 +861,11 @@ class TaylorEstimator(_SurveyEstimator):
             raise AssertionError("x must be provided for ratio estimation.")
 
         if self.param == PopParam.median:
-            self.q_method = q_method
+            if not isinstance(q_method, QuantileMethod):
+                raise ValueError("q_method must be a QuantileMethod.")
+            q_method_ = q_method
         else:
-            self.q_method = None
+            q_method_ = None
 
         _y = numpy_array(y)
         _x = numpy_array(x)
@@ -893,41 +896,43 @@ class TaylorEstimator(_SurveyEstimator):
                 _samp_weight[to_keep] if _samp_weight.shape not in ((), (0,)) else _samp_weight
             )
 
-        self.by = np.unique(_by).tolist() if _by.shape not in ((), (0,)) else _by
-        self.strata = np.unique(_stratum) if _stratum.shape not in ((), (0,)) else _stratum
-
-        self.domains = np.unique(_domain) if _domain.shape not in ((), (0,)) else _domain
-
-        if _stratum.shape not in ((), (0,)):
-            # TODO: we could improve efficiency by creating the pair [stratum,psu, ssu] ounce and
-            # use it in get_single_psu_strata and in the uncertainty calculation functions
-            self.single_psu_strata = get_single_psu_strata(_stratum, _psu)
-
+        # Design processing: everything below happens on local copies so that a
+        # validation or combining failure leaves the estimator (and the caller's
+        # arrays) exactly as the last successful call did.
+        single_psu_strata = None
         skipped_strata = np.array(None)
-        if self.single_psu_strata is not None:
+        combined = False
+        if _stratum.shape not in ((), (0,)):
+            single_psu_strata = get_single_psu_strata(_stratum, _psu)
+
+        if single_psu_strata is not None:
+            if isinstance(single_psu, dict):
+                requested_methods = set(single_psu.values())
+            else:
+                requested_methods = {single_psu}
+
+            # Phase 1: methods that drop strata or relabel PSUs (strata labels are
+            # still the original ones at this point).
             if single_psu == SinglePSUEst.error:
-                _raise_singleton_error(self.single_psu_strata)
+                _raise_singleton_error(single_psu_strata)
             if single_psu == SinglePSUEst.skip:
                 skipped_strata = _skip_singleton(
-                    single_psu_strata=self.single_psu_strata, skipped_strata=self.single_psu_strata
+                    single_psu_strata=single_psu_strata, skipped_strata=single_psu_strata
                 )
             if single_psu == SinglePSUEst.certainty:
                 _psu = _certainty_singleton(
-                    singletons=self.single_psu_strata,
+                    singletons=single_psu_strata,
                     _stratum=_stratum,
                     _psu=_psu,
                     _ssu=_ssu,
                 )
-            if single_psu == SinglePSUEst.combine:
-                _stratum = _combine_strata(strata_comb, _stratum)
-            # TODO: more method for singleton psus to be implemented
             if isinstance(single_psu, dict):
                 for s in single_psu:
                     if single_psu[s] == SinglePSUEst.error:
-                        _raise_singleton_error(self.single_psu_strata)
+                        _raise_singleton_error(single_psu_strata)
                     if single_psu[s] == SinglePSUEst.skip:
                         skipped_strata = _skip_singleton(
-                            single_psu_strata=self.single_psu_strata, skipped_strata=numpy_array(s)
+                            single_psu_strata=single_psu_strata, skipped_strata=numpy_array(s)
                         )
                     if single_psu[s] == SinglePSUEst.certainty:
                         _psu = _certainty_singleton(
@@ -936,25 +941,42 @@ class TaylorEstimator(_SurveyEstimator):
                             _psu=_psu,
                             _ssu=_ssu,
                         )
-                    if single_psu[s] == SinglePSUEst.combine:
-                        _stratum = _combine_strata(strata_comb, _stratum)
+            # Phase 2: combining freezes the PSU identity against the original
+            # strata, then relabels the variance strata in one simultaneous pass.
+            if SinglePSUEst.combine in requested_methods:
+                _psu = psu_identity(_stratum, _psu)
+                _stratum = _combine_strata(strata_comb, _stratum)
+                combined = True
+            # TODO: more method for singleton psus to be implemented
 
             skipped_strata = get_single_psu_strata(_stratum, _psu)
             if skipped_strata is not None and single_psu in [
                 SinglePSUEst.certainty,
                 SinglePSUEst.combine,
             ]:  # TODO: add the left our singletons when using the dict instead of SinglePSUEst
-                _raise_singleton_error(self.single_psu_strata)
+                _raise_singleton_error(skipped_strata)
 
-        if not isinstance(fpc, dict):
-            self.fpc = fpc_as_dict(_stratum, fpc)
-        else:
-            if list(np.unique(_stratum)) != list(fpc.keys()):
-                raise AssertionError("fpc dictionary keys must be the same as the strata!")
-            else:
-                self.fpc = fpc
+        _fpc = _validate_fpc(fpc, _stratum, combined=combined)
 
+        # Validation and design processing succeeded: commit the design and reset
+        # the per-call results so this call behaves like a fresh estimator.
+        self.q_method = q_method_
+        self.by = np.unique(_by).tolist() if _by.shape not in ((), (0,)) else _by
+        self.strata = np.unique(_stratum) if _stratum.shape not in ((), (0,)) else _stratum
+        self.domains = np.unique(_domain) if _domain.shape not in ((), (0,)) else _domain
+        self.single_psu_strata = single_psu_strata
+        self.fpc = _fpc
         self.as_factor = as_factor
+        self.point_est = {}
+        self.variance = {}
+        self.covariance = {}
+        self.stderror = {}
+        self.coef_var = {}
+        self.lower_ci = {}
+        self.upper_ci = {}
+        self.degree_of_freedom = None
+        self.nb_strata = None
+        self.nb_psus = None
 
         if self.param == PopParam.median:
             if _samp_weight.shape not in ((), (0,)):
@@ -1089,6 +1111,9 @@ class TaylorEstimator(_SurveyEstimator):
                 self.coef_var,
                 self.deff,
             )
+        # cast to object first: newer pandas versions type empty columns as str,
+        # which rejects the PopParam enum
+        est_df = est_df.astype({est_df.columns[0]: "object"})
         est_df.iloc[:, 0] = self.param
 
         return est_df

@@ -284,25 +284,65 @@ def plot_kurtosis(
     )
 
 
+def psu_identity(stratum: Array, psu: Array) -> np.ndarray:
+    """Computes integer codes identifying the distinct primary sampling units (PSUs).
+
+    A PSU is identified by the pair *(stratum, psu)*: two records sharing the same
+    psu label but sitting in different strata are different sampling units, while
+    records sharing both labels are the same unit. The codes therefore remain valid
+    when strata are later relabelled or combined for variance estimation: the
+    identity of a unit never depends on the *variance* stratum label, only on the
+    stratum the unit was sampled from.
+
+    The codes are dense integers (0, 1, ..., nb_psus - 1). The actual code values
+    may depend on the order of the observations, but the partition of the
+    observations they induce does not: reordering the records or renaming the psu
+    labels within each stratum yields the same groups, hence the same variance
+    estimates downstream.
+
+    Args:
+        stratum: per-record stratum labels. May be empty for unstratified designs,
+            in which case the psu labels alone define the units.
+        psu: per-record psu labels. May be empty, meaning each record is its own
+            unit (the ultimate sampling units are the observations).
+
+    Returns:
+        np.ndarray: one int64 code per record, one code per distinct PSU.
+    """
+    stratum = numpy_array(stratum)
+    psu = numpy_array(psu)
+
+    if psu.shape in ((), (0,)):
+        nb_records = stratum.shape[0] if stratum.shape not in ((), (0,)) else 0
+        return np.arange(nb_records, dtype=np.int64)
+    if stratum.shape in ((), (0,)):
+        stratum = np.ones(psu.shape[0], dtype=np.int64)
+
+    df = pl.DataFrame({"_stratum": stratum, "_psu": psu})
+    codes = df.select(
+        (pl.struct(["_stratum", "_psu"]).rank("dense") - 1).cast(pl.Int64).alias("_uid")
+    )
+
+    return codes["_uid"].to_numpy()
+
+
 def get_single_psu_strata(stratum: Array, psu: Array) -> Optional(np.ndarray):
     stratum = numpy_array(stratum)
     psu = numpy_array(psu)
 
-    if psu.shape in (
-        (),
-        (0,),
-    ):  # psu is None will not work because psu is an np.ndarray
-        strata_ids, psu_counts = np.unique(stratum, return_counts=True)
-    else:
-        df = (
-            pl.DataFrame({"stratum": stratum, "psu": psu})
-            .unique(["stratum", "psu"])
-            .group_by("stratum")
-            .agg(pl.col("psu").count())
-            .filter(pl.col("psu") == 1)
-        )
+    if stratum.shape in ((), (0,)):
+        return None
 
-        if df.shape[0] == 0:
-            return None
-        else:
-            return df["stratum"].to_numpy()
+    psu_uid = psu_identity(stratum, psu)
+    strata_ids, stratum_codes = np.unique(stratum, return_inverse=True)
+    # one distinct pair (stratum, psu_uid) per distinct PSU
+    pair_codes = stratum_codes * (int(psu_uid.max()) + 1) + psu_uid
+    _, first_occurrence = np.unique(pair_codes, return_index=True)
+    nb_psus_per_stratum = np.bincount(
+        stratum_codes[first_occurrence], minlength=strata_ids.size
+    )
+
+    if (nb_psus_per_stratum == 1).any():
+        return strata_ids[nb_psus_per_stratum == 1]
+    else:
+        return None

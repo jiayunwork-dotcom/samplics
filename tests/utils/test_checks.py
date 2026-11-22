@@ -233,3 +233,120 @@ def test_assert_brr_number_psus_sucesses():
 @pytest.mark.xfail(strict=True, reason="Not a multiple of 2")
 def test_assert_brr_number_psus_fails():
     assert assert_brr_number_psus(np.array([1, 2, 3])) is None
+
+
+"""Tests for the stratum-combining and fpc-validation helpers."""
+
+import numpy as np
+import pytest
+
+from samplics.utils.checks import _combine_strata, _validate_fpc
+
+
+def test_combine_strata_simultaneous_relabel_not_transitive():
+    stratum = np.array(["A", "A", "B", "B", "C", "C"])
+    out = _combine_strata({"A": "B", "B": "C"}, stratum)
+    # rows of A land in B, rows of B land in C: A's rows are NOT moved on to C
+    assert (out == np.array(["B", "B", "C", "C", "C", "C"])).all()
+
+
+def test_combine_strata_unlisted_strata_stay():
+    stratum = np.array(["A", "B", "C", "D"])
+    out = _combine_strata({"A": "C"}, stratum)
+    assert (out == np.array(["C", "B", "C", "D"])).all()
+
+
+def test_combine_strata_target_may_be_existing_stratum():
+    stratum = np.array([1, 1, 2, 2, 3, 3])
+    out = _combine_strata({3: 2}, stratum)
+    assert (out == np.array([1, 1, 2, 2, 2, 2])).all()
+    assert out.dtype == stratum.dtype
+
+
+def test_combine_strata_long_target_not_truncated():
+    stratum = np.array(["S1", "S1", "S2", "S2"])  # numpy width is 2 chars
+    out = _combine_strata({"S1": "A_MUCH_LONGER_NAME", "S2": "A_MUCH_LONGER_NAME"}, stratum)
+    assert (out == "A_MUCH_LONGER_NAME").all()
+
+
+def test_combine_strata_does_not_mutate_caller_array():
+    stratum = np.array(["A", "A", "B", "B"])
+    snapshot = stratum.copy()
+    mapping = {"A": "C", "B": "C"}
+    _combine_strata(mapping, stratum)
+    assert (stratum == snapshot).all()
+    assert mapping == {"A": "C", "B": "C"}
+
+
+def test_combine_strata_object_dtype_labels():
+    stratum = np.array(["A", "A", "B", "B"], dtype=object)
+    out = _combine_strata({"A": "LONG_TARGET", "B": "LONG_TARGET"}, stratum)
+    assert (out == "LONG_TARGET").all()
+
+
+def test_combine_strata_invalid_mappings():
+    stratum = np.array(["A", "A", "B", "B"])
+    with pytest.raises(ValueError):  # not a mapping
+        _combine_strata(None, stratum)
+    with pytest.raises(ValueError):  # empty mapping
+        _combine_strata({}, stratum)
+    with pytest.raises(ValueError):  # missing source
+        _combine_strata({"A": "C", "ZZZ": "C"}, stratum)
+    with pytest.raises(ValueError):  # int target for string labels
+        _combine_strata({"A": 3}, stratum)
+    with pytest.raises(ValueError):  # bool target
+        _combine_strata({"A": True}, stratum)
+    with pytest.raises(ValueError):  # stringified source for int labels
+        _combine_strata({"1": "2"}, np.array([1, 1, 2, 2]))
+    with pytest.raises(ValueError):  # stringified target for int labels
+        _combine_strata({1: "2"}, np.array([1, 1, 2, 2]))
+    with pytest.raises(ValueError):  # float labels are not supported
+        _combine_strata({1.5: 2.5}, np.array([1.5, 1.5, 2.5, 2.5]))
+
+
+def test_validate_fpc_scalar_broadcast_to_final_strata():
+    stratum = np.array(["C", "C", "D", "D"])
+    assert _validate_fpc(0.5, stratum, combined=True) == {"C": 0.5, "D": 0.5}
+
+
+def test_validate_fpc_dict_key_order_irrelevant():
+    stratum = np.array(["C", "C", "D", "D"])
+    out1 = _validate_fpc({"C": 0.9, "D": 0.8}, stratum, combined=True)
+    out2 = _validate_fpc({"D": 0.8, "C": 0.9}, stratum, combined=True)
+    assert out1 == out2
+    assert list(out1.keys()) == list(out2.keys())
+
+
+def test_validate_fpc_dict_must_cover_exactly_final_strata():
+    stratum = np.array(["C", "C", "D", "D"])
+    with pytest.raises(ValueError):  # missing D
+        _validate_fpc({"C": 0.5}, stratum, combined=True)
+    with pytest.raises(ValueError):  # extra key (disappeared stratum)
+        _validate_fpc({"C": 0.5, "D": 0.5, "A": 0.5}, stratum, combined=True)
+
+
+def test_validate_fpc_values_must_be_finite_reals_in_unit_interval():
+    stratum = np.array(["C", "C"])
+    for bad in (True, False, "0.5", None, -0.1, 1.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            _validate_fpc(bad, stratum)
+        with pytest.raises(ValueError):
+            _validate_fpc({"C": bad}, stratum)
+    # boundary values are valid
+    assert _validate_fpc(0, stratum) == {"C": 0}
+    assert _validate_fpc(1, stratum) == {"C": 1}
+
+
+def test_validate_fpc_unstratified_scalar():
+    assert _validate_fpc(0.7, np.array(())) == 0.7
+    with pytest.raises(ValueError):
+        _validate_fpc({"C": 0.5}, np.array(()))
+
+
+def test_validate_fpc_array_rejected_when_combined():
+    stratum = np.array(["C", "C", "D", "D"])
+    with pytest.raises(ValueError):
+        _validate_fpc(np.array([0.5, 0.5, 0.6, 0.6]), stratum, combined=True)
+    # without combining, a per-observation array keeps its historical meaning
+    out = _validate_fpc(np.array([0.5, 0.5, 0.6, 0.6]), stratum, combined=False)
+    assert out == {"C": 0.5, "D": 0.6}
